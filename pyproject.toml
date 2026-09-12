@@ -1,0 +1,18 @@
+[project]
+name = "website-autospy"
+version = "0.1.0"
+description = "Playwright website health-check autopsy"
+readme = "README.md"
+authors = [
+    { name = "priyankarpal", email = "88102392+priyankarpal@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = ["playwright>=1.40", "click>=8", "rich>=13"]
+
+[project.scripts]
+website-autospy = "website_autospy:main"
+autopsy = "website_autospy:main"
+
+[build-system]
+requires = ["uv_build>=0.12.12,<0.13.0"]
+build-backend = "uv_build"
