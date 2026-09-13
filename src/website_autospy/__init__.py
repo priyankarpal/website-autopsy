@@ -47,7 +47,7 @@ _load_dotenv()
               envvar="AUTOPSY_MAX_DEPTH", help="Max crawl depth from start URL")
 @click.option("--headless/--headed", default=True, show_default=True)
 def main(url: str | None, output: str, max_pages: int, max_depth: int, headless: bool):
-    """Run a forensic health check on URL and emit a dramatic HTML report.
+    """Run a health check on URL and write a static HTML report.
 
     URL can be omitted if the WEBSITE (or WEBSITE_URL) env var / .env is set.
     """
