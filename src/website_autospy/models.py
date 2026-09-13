@@ -43,6 +43,16 @@ DEEP_CHECKS: list[dict] = [
     {"id": "sec.headers", "category": "Security", "label": "Security headers (CSP, HSTS, X-Frame, X-CTO, Referrer)"},
     {"id": "sec.transport", "category": "Security", "label": "HTTPS enforcement, mixed content & cookie flags"},
     {"id": "sec.exposure", "category": "Security", "label": "Exposed paths: robots/sitemap + admin/.env/.git probes"},
+    {"id": "seo.duplicates", "category": "SEO", "label": "Duplicate titles/descriptions + thin-content detection across pages"},
+    {"id": "seo.thin-content", "category": "SEO", "label": "Thin-content flag per page (very little visible text)"},
+    {"id": "seo.structured", "category": "SEO", "label": "Structured-data (JSON-LD) + social-card completeness per page"},
+    {"id": "perf.runtime", "category": "Performance", "label": "Per-type transfer + third-party/render-blocking attribution"},
+    {"id": "perf.stability", "category": "Performance", "label": "Layout-stability signals (overflow, undimensioned media)"},
+    {"id": "a11y.interaction", "category": "Accessibility", "label": "Keyboard reachability, landmarks + heading-outline depth"},
+    {"id": "form.validation", "category": "Forms", "label": "Required-field validation-message association"},
+    {"id": "sec.posture", "category": "Security", "label": "CSP strength + HSTS/cookie-flag posture grading"},
+    {"id": "sec.secrets", "category": "Security", "label": "Secret-looking strings in served script URLs"},
+    {"id": "link.chains", "category": "Content", "label": "Tracking-parameter + redirect-chain hygiene"},
 ]
 
 
