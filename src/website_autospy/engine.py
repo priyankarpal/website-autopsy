@@ -18,7 +18,6 @@ MAX_LINKS_TO_VERIFY = 250
 async def _check_link_status(context, url: str, timeout_ms=10000) -> tuple[int | None, str]:
     """Use Playwright request (shares cookies) to check a link without full navigation."""
     try:
-        # Prefer HEAD, fall back to GET
         resp = await context.request.head(url, timeout=timeout_ms)
         status = resp.status
         if status in (405, 501):
@@ -26,12 +25,29 @@ async def _check_link_status(context, url: str, timeout_ms=10000) -> tuple[int |
             status = resp.status
         return status, ""
     except Exception as e:
-        # fallback: full GET
         try:
             resp = await context.request.get(url, timeout=timeout_ms)
             return resp.status, ""
         except Exception as e2:
             return None, str(e2)[:200]
+
+
+def audit_page(data: dict, page_url: str, load_ms: int, shot: str | None,
+               headers: dict, failed_reqs: list[str], bad_responses: list[dict],
+               result: AutopsyResult) -> None:
+    """Run every offline per-page audit over one collected bundle.
+
+    Pure: needs no browser, only the bundle plus listener-collected
+    failures. Append-only on result.
+    """
+    _audit_seo(data.get("seo", {}), page_url, shot, result)
+    _audit_a11y(data, page_url, shot, result)
+    _audit_perf(data, page_url, load_ms, shot, result)
+    _audit_content(data, page_url, shot, result)
+    _audit_network(failed_reqs, bad_responses, page_url, shot, result)
+    _audit_link_hygiene(data.get("links", []), page_url, result)
+    _audit_mixed_content(data.get("mixed", []), page_url, headers, result)
+    _run_depth_audits(data, page_url, load_ms, shot, headers, result)
 
 
 async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
@@ -66,10 +82,11 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
         context = await browser.new_context(ignore_https_errors=True)
-        # silence downloads blowing up
         page = await context.new_page()
 
         js_errors_seen: set[str] = set()
+        site_script_urls: list[str] = []
+        site_script_seen: set[str] = set()
 
         while queue and len(visited) < max_pages:
             url, depth = queue.pop(0)
@@ -83,7 +100,7 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
             console_errors: list[str] = []
             page_errors: list[str] = []
             failed_reqs: list[str] = []
-            resp_log: list[dict] = []  # every sub-resource response for deep audit
+            resp_log: list[dict] = []
             main_headers: dict = {}
             main_final_url: str = nurl
 
@@ -156,7 +173,7 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                 _detach(page, _on_console, _on_pageerror, _on_failed, _on_response)
                 continue
 
-            # main-document headers (fallback: navigation response object)
+            # main-document headers
             if not main_headers and resp is not None:
                 try:
                     for k, v in (resp.headers or {}).items():
@@ -166,7 +183,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
             if is_first_page:
                 _audit_site_security(target, main_headers, context, result)
 
-            # page screenshot (proves state)
             pname, ppath = snap_name("page")
             try:
                 await page.screenshot(path=str(ppath), full_page=False)
@@ -177,7 +193,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                                            screenshot=f"screenshots/{pname}" if pname else None,
                                            links_found=0))
 
-            # --- slow page check ---
             if load_ms > 3000:
                 sev = "high" if load_ms > 8000 else "medium"
                 result.issues.append(Issue(
@@ -190,7 +205,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                     check="nav.load-budget",
                     evidence={"load_ms": load_ms}))
 
-            # --- JS errors ---
             for err in page_errors + console_errors:
                 key = hashlib_sig(nurl, err)
                 if key in js_errors_seen:
@@ -206,7 +220,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                     detail=err, page=nurl, severity="high",
                     screenshot=f"screenshots/{ename}" if ename else None))
 
-            # --- extract links + buttons + forms in one JS pass ---
             try:
                 data = await page.evaluate("""() => {
                   const q = s => [...document.querySelectorAll(s)];
@@ -263,6 +276,16 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                     linksTotal: links.length
                   };
                   const mixed = res.filter(r=>location.protocol==='https:'&&(r.name||'').startsWith('http://')).slice(0,8);
+                  const bodyText = document.body?(document.body.innerText||''):'' ;
+                  const textWords = bodyText.split(/\\s+/).filter(Boolean).length;
+                  const jsonLd = q('script[type="application/ld+json"]').length;
+                  const ogVals = ['og:title','og:description','og:image'].map(p=>(document.querySelector(`meta[property="${p}"]`)||{}).content||'');
+                  const ogComplete = ogVals.every(Boolean);
+                  const hasSkipLink = q('a[href^="#"].skip-link, a[href^="#main"], a[href^="#content"], [class*="skip"]').length > 0 || q('a[href^="#"]').some(a => /skip|main content|jump to/i.test((a.innerText||'') + ' ' + (a.className||'')));
+                  const landmarks = {main: q('main').length, nav: q('nav').length};
+                  const emptyHeadings = q('h1,h2,h3,h4,h5,h6').filter(h=>!(h.innerText||'').trim()).length;
+                  const syncHeadScripts = q('head script[src]').filter(s=>!s.defer&&!s.async).length;
+                  const overflowX = document.documentElement.scrollWidth > window.innerWidth + 1;
                   return {links: links.slice(0,300), btns: btns.slice(0,60), forms, imgs,
                           seo, dupIds, dupCount: dupIds.length, posTab, skipLevel,
                           smallTargets: btns.filter(b=>b.visible&&((b.w>0&&b.w<24)||(b.h>0&&b.h<24))).length,
@@ -270,14 +293,15 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                           res, totKB, big, mixed,
                           domNodes: document.getElementsByTagName('*').length,
                           scripts: q('script[src]').length,
-                          bodyLen: document.body?document.body.innerHTML.length:0};
+                          bodyLen: document.body?document.body.innerHTML.length:0,
+                          textWords, jsonLd, ogComplete, hasSkipLink, landmarks,
+                          emptyHeadings, syncHeadScripts, overflowX};
                 }""")
             except Exception:
                 data = {"links": [], "btns": [], "forms": [], "imgs": [], "bodyLen": 0,
                         "seo": {}, "res": [], "totKB": 0, "big": [], "mixed": [],
                         "domNodes": 0, "scripts": 0, "dupIds": [], "nav": {}}
 
-            # queue internal links
             internal_new = 0
             for l in data.get("links", []):
                 href = l.get("href", "")
@@ -300,18 +324,18 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                 result.pages[-1].dom_nodes = int(data.get("domNodes") or 0)
                 result.pages[-1].images = len(data.get("imgs", []))
                 result.pages[-1].scripts = int(data.get("scripts") or 0)
+            for res in data.get("res", []) or []:
+                name = str(res.get("name") or "")
+                if (name.endswith(".js") or (res.get("type") or "") == "script") \
+                        and name not in site_script_seen:
+                    site_script_seen.add(name)
+                    if len(site_script_urls) < 200:
+                        site_script_urls.append(name)
 
             shot = f"screenshots/{pname}" if pname else None
-            # --- deep audits: SEO / a11y / perf / content / network / link hygiene ---
-            _audit_seo(data.get("seo", {}), nurl, shot, result)
-            _audit_a11y(data, nurl, shot, result)
-            _audit_perf(data, nurl, load_ms, shot, result)
-            _audit_content(data, nurl, shot, result)
-            _audit_network(failed_reqs, resp_log, nurl, shot, result)
-            _audit_link_hygiene(data.get("links", []), nurl, result)
-            _audit_mixed_content(data.get("mixed", []), nurl, main_headers, result)
+            audit_page(data, nurl, load_ms, shot, main_headers,
+                       failed_reqs, resp_log, result)
 
-            # --- dead button test (visible only) ---
             candidates = [b for b in data.get("btns", []) if b.get("visible")][:MAX_BUTTONS_PER_PAGE]
             for b in candidates:
                 dead, detail, latency = await _test_button(page, b, nurl)
@@ -345,7 +369,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                         page=nurl, severity="medium",
                         screenshot=f"screenshots/{ename}" if ename else None))
 
-            # --- forms (deep: structure + labels + autocomplete + input types) ---
             for fi, f in enumerate(data.get("forms", [])[:6]):
                 result.forms_tested += 1
                 inputs = f.get("inputs", [])
@@ -405,7 +428,7 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                         page=nurl, severity="critical", screenshot=fshot,
                         recommendation="Switch to method=\"post\" over HTTPS. Never put credentials in query strings.",
                         check="sec.transport"))
-                # try a safe fill (no submit) to prove testability
+                # safe fill without submitting
                 try:
                     await _fill_form(page, fi)
                 except Exception:
@@ -415,12 +438,10 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
 
         await page.close()
 
-        # --- broken links verification (cap) ---
         link_items = list(all_links.items())[:MAX_LINKS_TO_VERIFY]
         for link_url, found_on in link_items:
             status_code, err = await _check_link_status(context, link_url)
             if status_code is None or status_code >= 400:
-                # screenshot the source page for proof
                 src_shot = next((p.screenshot for p in result.pages if p.url == normalize(found_on)), None)
                 reason = f"HTTP {status_code}" if status_code else f"request failed: {err[:120]}"
                 result.issues.append(Issue(
@@ -431,10 +452,8 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                     screenshot=src_shot,
                     evidence={"link": link_url, "status": status_code}))
 
-        # --- hidden pages: robots/sitemap + common paths + orphans ---
         await _discover_hidden(context, target, result, shots, snap_name)
 
-        # --- cookie flag audit (deep transport check) ---
         try:
             cookies = await context.cookies()
             https = target.startswith("https://")
@@ -455,6 +474,21 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                     page=target, severity="medium",
                     recommendation="Set HttpOnly on session/auth cookies; expose only what JS needs.",
                     check="sec.transport"))
+        except Exception:
+            pass
+
+        try:
+            audit_site_seo_duplicates(
+                [{"url": p.url, "title": p.title} for p in result.pages], result)
+        except Exception:
+            pass
+        try:
+            site_cookies = await context.cookies()
+        except Exception:
+            site_cookies = []
+        try:
+            audit_security_posture(target, {}, site_cookies,
+                                   site_script_urls[:60], None, result)
         except Exception:
             pass
 
@@ -573,10 +607,7 @@ async def _fill_form(page, form_idx: int):
             continue
 
 
-# ---------------------------------------------------------------------------
 # Deep audits: each maps to one or more entries in models.DEEP_CHECKS.
-# They only *add* issues when a real defect is measured — no noise.
-# ---------------------------------------------------------------------------
 
 def _audit_seo(seo: dict, page_url: str, shot: str | None, result: AutopsyResult) -> None:
     if not seo:
@@ -848,31 +879,363 @@ def _audit_site_security(target: str, headers: dict, context, result: AutopsyRes
             page=target, severity="critical",
             recommendation="Redirect all HTTP → HTTPS with HSTS preload.",
             check="sec.transport"))
-    # cookie flags
+
+
+def _run_depth_audits(data: dict, page_url: str, load_ms: int,
+                      shot: str | None, headers: dict,
+                      result: AutopsyResult) -> None:
+    """Fan out the second-wave depth audits over one page's evidence bundle.
+
+    Builds the small additive evidence shapes from the single collection pass
+    and delegates to the public pure audit seams. Never raises: depth must
+    not break the baseline crawl.
+    """
+    def guard(fn) -> None:
+        try:
+            fn()
+        except Exception:
+            pass
+
+    def seo() -> None:
+        seo = data.get("seo", {}) or {}
+        og = seo.get("og") or []
+        audit_seo_depth({
+            "wordCount": data.get("textWords"),
+            "jsonLd": data.get("jsonLd"),
+            "ogComplete": data.get("ogComplete", bool(og and all(og))),
+        }, page_url, shot, result)
+
+    def perf() -> None:
+        by_type: dict[str, float] = {}
+        third_kb = 0.0
+        target_host = urllib.parse.urlparse(result.target).hostname or ""
+        for res in data.get("res", []) or []:
+            kind = str(res.get("type") or "other").lower() or "other"
+            size_kb = float(res.get("size") or 0) / 1024
+            by_type[kind] = by_type.get(kind, 0.0) + size_kb
+            host = urllib.parse.urlparse(str(res.get("name") or "")).hostname or ""
+            if host and host != target_host:
+                third_kb += size_kb
+        nodims = sum(1 for i in (data.get("imgs", []) or []) if i.get("noDims"))
+        audit_perf_depth({
+            "byType": {k: round(v, 1) for k, v in by_type.items()},
+            "thirdPartyKB": round(third_kb, 1),
+            "syncHeadScripts": data.get("syncHeadScripts"),
+            "overflowX": data.get("overflowX"),
+            "noDims": nodims,
+        }, page_url, load_ms, shot, result)
+
+    def a11y() -> None:
+        val_gaps: list[str] = []
+        for f in data.get("forms", []) or []:
+            for inp in f.get("inputs", []) or []:
+                if inp.get("required") and not inp.get("hasRealLabel"):
+                    val_gaps.append(str(inp.get("name") or "field")[:40])
+        audit_a11y_interaction({
+            "posTab": data.get("posTab"),
+            "hasSkipLink": data.get("hasSkipLink"),
+            "landmarks": data.get("landmarks"),
+            "emptyHeadings": data.get("emptyHeadings"),
+            "formValidationGaps": val_gaps,
+        }, page_url, shot, result)
+
+    def security() -> None:
+        script_urls = [str(r.get("name") or "")
+                       for r in (data.get("res", []) or [])
+                       if str(r.get("name") or "").endswith(".js")
+                       or (r.get("type") or "") == "script"][:20]
+        audit_security_posture(page_url, headers or {}, [], script_urls,
+                               shot, result)
+
+    def links() -> None:
+        audit_link_depth(data.get("links", []) or [], page_url, shot, result)
+
+    for step in (seo, perf, a11y, security, links):
+        guard(step)
+
+
+def audit_seo_depth(evidence: dict, page_url: str, shot: str | None,
+                    result: AutopsyResult) -> None:
+    """Per-page SEO depth: structured-data/social completeness + thin content.
+
+    Pure audit seam: ``evidence`` may omit any key (treated as unknown → skip).
+    """
+    ev = evidence or {}
+    if not ev:
+        return
+    words = ev.get("wordCount")
+    json_ld = ev.get("jsonLd")
+    og_complete = ev.get("ogComplete")
+    if json_ld is not None or og_complete is not None:
+        has_structured = (int(json_ld or 0) > 0) or bool(og_complete)
+        if not has_structured:
+            result.issues.append(Issue(
+                kind="seo", title="No structured data or complete social card",
+                detail="No JSON-LD block and no complete Open Graph set — "
+                       "the page is ineligible for rich results and renders "
+                       "as a bare URL on shares.",
+                page=page_url, severity="low", screenshot=shot,
+                recommendation="Add JSON-LD structured data matching page type "
+                               "and complete og:title/description/image tags.",
+                check="seo.structured",
+                evidence={"jsonLd": int(json_ld or 0),
+                          "ogComplete": bool(og_complete)}))
+    if words is not None:
+        try:
+            wc = int(words)
+        except (TypeError, ValueError):
+            wc = -1
+        if 0 <= wc < 100:
+            result.issues.append(Issue(
+                kind="seo", title=f"Thin content: ~{wc} words of visible text",
+                detail="Very little indexable text — placeholder, doorway, or "
+                       "JS-rendering failure. Thin pages rarely rank and often "
+                       "signal an unfinished route.",
+                page=page_url, severity="medium", screenshot=shot,
+                recommendation="Ship real copy (aim 300+ words) or noindex the "
+                               "route until it is real. If content renders "
+                               "client-side, verify the crawler saw it.",
+                check="seo.thin-content", evidence={"wordCount": wc}))
+
+
+def audit_site_seo_duplicates(pages: list[dict], result: AutopsyResult) -> None:
+    """Site-level SEO depth: collapse duplicate titles into one issue.
+
+    ``pages`` is a list of ``{"url": ..., "title": ...}`` mappings.
+    """
+    seen: dict[str, list[str]] = {}
+    for p in pages or []:
+        title = (p.get("title") or "").strip()
+        url = p.get("url") or ""
+        if not title or not url:
+            continue
+        seen.setdefault(title.lower(), []).append(url)
+    dupes = {t: urls for t, urls in seen.items() if len(urls) > 1}
+    if not dupes:
+        return
+    worst_title, worst_urls = sorted(dupes.items(), key=lambda kv: -len(kv[1]))[0]
+    sample = ", ".join(worst_urls[:5])
+    extra = f" (+{len(worst_urls) - 5} more)" if len(worst_urls) > 5 else ""
+    others = sum(len(v) for v in dupes.values()) - len(worst_urls)
+    suffix = f" {others} page(s) share other titles." if others else ""
+    result.issues.append(Issue(
+        kind="seo", title=f"{len(dupes)} duplicate title group(s) across pages",
+        detail=f"Title {worst_title!r} repeats on {len(worst_urls)} pages: "
+               f"{sample}{extra}.{suffix} Duplicates split ranking signals.",
+        page=worst_urls[0], severity="medium",
+        recommendation="Give every page a unique descriptive title; template "
+                       "in section or product names instead of reusing one.",
+        check="seo.duplicates",
+        evidence={"groups": len(dupes), "sample": sample[:220]}))
+
+
+def audit_perf_depth(evidence: dict, page_url: str, load_ms: int,
+                     shot: str | None, result: AutopsyResult) -> None:
+    """Runtime + weight depth: per-type attribution and layout stability."""
+    ev = evidence or {}
+    if not ev:
+        return
+    by_type = ev.get("byType") or {}
+    third_kb = float(ev.get("thirdPartyKB") or 0)
+    sync_head = int(ev.get("syncHeadScripts") or 0)
+    script_kb = float(by_type.get("script") or 0)
+    total_typed = sum(float(v or 0) for v in by_type.values())
+    if script_kb > 800 or sync_head >= 3 or third_kb > 600:
+        parts = []
+        if script_kb:
+            parts.append(f"scripts {script_kb:.0f} KB")
+        if third_kb:
+            parts.append(f"third-party {third_kb:.0f} KB")
+        if sync_head:
+            parts.append(f"{sync_head} sync head script(s)")
+        result.issues.append(Issue(
+            kind="perf",
+            title=f"JS weight concentration ({', '.join(parts) or 'heavy client bundle'})",
+            detail=f"Client weight {' / '.join(parts)} of ~{total_typed:.0f} KB "
+                   f"typed transfer. Blocking scripts delay interactivity well "
+                   f"past first paint.",
+            page=page_url, severity="medium", screenshot=shot,
+            recommendation="Code-split by route, defer non-critical scripts, "
+                           "self-host or facade third-party embeds.",
+            check="perf.runtime",
+            evidence={"scriptKB": script_kb, "thirdPartyKB": third_kb,
+                      "syncHeadScripts": sync_head}))
+    overflow = bool(ev.get("overflowX"))
+    nodims = int(ev.get("noDims") or 0)
+    if overflow or nodims >= 5:
+        detail = []
+        if overflow:
+            detail.append("horizontal overflow past the viewport")
+        if nodims >= 5:
+            detail.append(f"{nodims} media node(s) without dimensions")
+        result.issues.append(Issue(
+            kind="perf", title="Layout-stability risk",
+            detail="; ".join(detail) + " — both drive cumulative layout shift "
+                   "as content pops in or forces sideways scroll.",
+            page=page_url, severity="low", screenshot=shot,
+            recommendation="Reserve space with width/height or aspect-ratio, "
+                           "and constrain full-bleed elements to 100vw.",
+            check="perf.stability",
+            evidence={"overflowX": overflow, "noDims": nodims}))
+
+
+def audit_a11y_interaction(evidence: dict, page_url: str, shot: str | None,
+                           result: AutopsyResult) -> None:
+    """Keyboard/landmark depth + required-field validation association."""
+    ev = evidence or {}
+    if not ev:
+        return
+    pos_tab = int(ev.get("posTab") or 0)
+    skip = ev.get("hasSkipLink")
+    landmarks = ev.get("landmarks") or {}
+    empty_h = int(ev.get("emptyHeadings") or 0)
+    gaps: list[str] = []
+    if pos_tab > 0:
+        gaps.append(f"{pos_tab} positive tabindex order hijack(s)")
+    if skip is False:
+        gaps.append("no skip link on a content page")
     try:
-        import urllib.parse as _up
-        origin = f"{_up.urlparse(target).scheme}://{_up.urlparse(target).netloc}"
-        # cookies are read opportunistically; Playwright context may hold some already
-        async def _noop():  # placeholder — real read happens in run_autopsy via context.cookies
-            return []
-    except Exception:
-        pass
+        main_n = int(landmarks.get("main", 1))
+        nav_n = int(landmarks.get("nav", 1))
+    except (TypeError, ValueError):
+        main_n, nav_n = 1, 1
+    if main_n == 0:
+        gaps.append("missing <main> landmark")
+    if empty_h > 0:
+        gaps.append(f"{empty_h} empty heading(s)")
+    if gaps:
+        result.issues.append(Issue(
+            kind="a11y", title="Keyboard/landmark navigation gaps",
+            detail="; ".join(gaps) + ". Keyboard and screen-reader users "
+                   "lose their map of the page.",
+            page=page_url, severity="medium" if pos_tab or main_n == 0 else "low",
+            screenshot=shot,
+            recommendation="Keep tab order in DOM order (tabindex 0/-1 only), "
+                           "add one skip link, one <main>, and fill headings.",
+            check="a11y.interaction", evidence={"gaps": "; ".join(gaps)[:220]}))
+    val_gaps = [g for g in (ev.get("formValidationGaps") or []) if g]
+    if val_gaps:
+        names = ", ".join(str(g)[:40] for g in val_gaps[:5])
+        result.issues.append(Issue(
+            kind="form",
+            title=f"{len(val_gaps)} required field(s) without validation messaging",
+            detail=f"Required fields with no associated error message region: "
+                   f"{names}. Assistive tech never announces what failed.",
+            page=page_url, severity="medium", screenshot=shot,
+            recommendation="Pair each required control with aria-describedby "
+                           "pointing at an error region updated on validation.",
+            check="form.validation", evidence={"fields": names[:220]}))
+
+
+_SECRET_HINTS = ("api_key", "apikey", "secret", "token", "aws_", "akia",
+                 "ghp_", "xox", "sk_live", "password=")
+
+
+def audit_security_posture(target: str, headers: dict, cookies: list,
+                           script_urls: list[str], shot: str | None,
+                           result: AutopsyResult) -> None:
+    """CSP/HSTS posture grading + secret-looking script-URL review flags."""
+    headers = {str(k).lower(): v for k, v in (headers or {}).items()}
+    csp = str(headers.get("content-security-policy") or "")
+    lowered = csp.lower()
+    posture_gaps: list[str] = []
+    if csp:
+        if "'unsafe-inline'" in lowered or "'unsafe-eval'" in lowered:
+            posture_gaps.append("CSP allows unsafe-inline/unsafe-eval")
+        if "frame-ancestors" not in lowered:
+            posture_gaps.append("CSP missing frame-ancestors")
+        if "object-src" not in lowered:
+            posture_gaps.append("CSP missing object-src")
+    hsts = str(headers.get("strict-transport-security") or "")
+    if target.startswith("https://") and hsts:
+        hl = hsts.lower()
+        try:
+            max_age = int(hl.split("max-age=")[1].split(";")[0].strip())
+        except (IndexError, ValueError):
+            max_age = 0
+        if max_age < 15552000 or "includesubdomains" not in hl:
+            posture_gaps.append("HSTS max-age short or missing includeSubDomains")
+    for c in cookies or []:
+        try:
+            name = str(c.get("name") or "?")
+            same_site = str(c.get("sameSite") or "")
+            secure = bool(c.get("secure"))
+            http_only = bool(c.get("httpOnly"))
+        except AttributeError:
+            continue
+        if same_site.lower() == "none" and not secure:
+            posture_gaps.append(f"cookie {name!r} is SameSite=None without Secure (browsers reject it)")
+        elif not http_only and any(k in name.lower() for k in ("sess", "auth", "token", "sid")):
+            posture_gaps.append(f"session-like cookie {name!r} readable from JavaScript (no HttpOnly)")
+    if posture_gaps:
+        result.issues.append(Issue(
+            kind="security", title="Weak content-security posture",
+            detail="; ".join(posture_gaps) + ".",
+            page=target, severity="medium", screenshot=shot,
+            recommendation="Tighten CSP (remove unsafe-* where possible, add "
+                           "frame-ancestors/object-src) and set HSTS "
+                           "max-age≥15552000 with includeSubDomains.",
+            check="sec.posture", evidence={"gaps": "; ".join(posture_gaps)[:220]}))
+    flagged: list[str] = []
+    for u in script_urls or []:
+        ul = str(u).lower()
+        if any(h in ul for h in _SECRET_HINTS):
+            flagged.append(str(u)[:160])
+            if len(flagged) >= 3:
+                break
+    for u in flagged:
+        result.issues.append(Issue(
+            kind="security", title="Secret-looking string in served script URL",
+            detail=f"{u} contains a token-like parameter — possibly a leaked "
+                   "key committed into markup or a build artifact.",
+            page=target, severity="low", screenshot=shot,
+            recommendation="Move secrets server-side; rotate anything that "
+                           "shipped in a URL and purge caches.",
+            check="sec.secrets", evidence={"url": u[:200]}))
+
+
+_TRACKING_PARAMS = ("utm_", "fbclid", "gclid", "msclkid", "_ga", "mc_eid",
+                    "sessionid", "phpsessid", "sid=")
+
+
+def audit_link_depth(links: list[dict], page_url: str, shot: str | None,
+                     result: AutopsyResult) -> None:
+    """Tracking-parameter hygiene over discovered links (no I/O)."""
+    hits = 0
+    sample = ""
+    for link in links or []:
+        href = str(link.get("href") or link.get("abs") or "")
+        if not href:
+            continue
+        q = urllib.parse.urlparse(href).query.lower()
+        if any(t in q for t in _TRACKING_PARAMS):
+            hits += 1
+            if not sample:
+                sample = href[:160]
+    if hits:
+        result.issues.append(Issue(
+            kind="content",
+            title=f"{hits} link(s) leak tracking/session parameters",
+            detail=f"e.g. {sample}. Tracking IDs in hrefs get copied, "
+                   "bookmarked, and indexed — diluting canonical signals.",
+            page=page_url, severity="low",
+            recommendation="Strip tracking params from authored links and "
+                           "canonicals; append them at click time instead.",
+            check="link.chains", evidence={"count": hits, "sample": sample[:200]}))
 
 
 async def _discover_hidden(context, target: str, result: AutopsyResult, shots: Path, snap_name) -> None:
     origin = f"{urllib.parse.urlparse(target).scheme}://{urllib.parse.urlparse(target).netloc}"
-    # robots.txt + sitemap.xml
     for path in ("robots.txt", "sitemap.xml"):
         try:
             r = await context.request.get(f"{origin}/{path}", timeout=8000)
             if r.status == 200:
                 body = (await r.text())[:4000]
                 name, p = snap_name("hidden")
-                # tiny text-proof screenshot placeholder: reuse first page shot
                 result.hidden_pages.append({"url": f"{origin}/{path}", "via": path, "detail": body[:300]})
         except Exception:
             pass
-    # common admin paths — only GET status, no screenshots hammering
+    # probe common paths by status only (no screenshots)
     sem = asyncio.Semaphore(6)
 
     async def probe(p: str):
@@ -881,11 +1244,10 @@ async def _discover_hidden(context, target: str, result: AutopsyResult, shots: P
             try:
                 r = await context.request.get(u, timeout=7000)
                 if r.status and r.status < 400:
-                    # filter out soft-404: same title/length as homepage? keep simple: record 200s
+                    # soft-404s are not filtered here
                     result.hidden_pages.append({"url": u, "via": "common-path probe", "detail": f"HTTP {r.status}"})
             except Exception:
                 pass
 
     await asyncio.gather(*(probe(p) for p in COMMON_HIDDEN_PATHS if p not in ("robots.txt", "sitemap.xml")))
-    # cap
     result.hidden_pages = result.hidden_pages[:15]

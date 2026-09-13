@@ -43,6 +43,16 @@ DEEP_CHECKS: list[dict] = [
     {"id": "sec.headers", "category": "Security", "label": "Security headers (CSP, HSTS, X-Frame, X-CTO, Referrer)"},
     {"id": "sec.transport", "category": "Security", "label": "HTTPS enforcement, mixed content & cookie flags"},
     {"id": "sec.exposure", "category": "Security", "label": "Exposed paths: robots/sitemap + admin/.env/.git probes"},
+    {"id": "seo.duplicates", "category": "SEO", "label": "Duplicate titles/descriptions + thin-content detection across pages"},
+    {"id": "seo.thin-content", "category": "SEO", "label": "Thin-content flag per page (very little visible text)"},
+    {"id": "seo.structured", "category": "SEO", "label": "Structured-data (JSON-LD) + social-card completeness per page"},
+    {"id": "perf.runtime", "category": "Performance", "label": "Per-type transfer + third-party/render-blocking attribution"},
+    {"id": "perf.stability", "category": "Performance", "label": "Layout-stability signals (overflow, undimensioned media)"},
+    {"id": "a11y.interaction", "category": "Accessibility", "label": "Keyboard reachability, landmarks + heading-outline depth"},
+    {"id": "form.validation", "category": "Forms", "label": "Required-field validation-message association"},
+    {"id": "sec.posture", "category": "Security", "label": "CSP strength + HSTS/cookie-flag posture grading"},
+    {"id": "sec.secrets", "category": "Security", "label": "Secret-looking strings in served script URLs"},
+    {"id": "link.chains", "category": "Content", "label": "Tracking-parameter + redirect-chain hygiene"},
 ]
 
 
@@ -155,12 +165,17 @@ class AutopsyResult:
             "perf": 4, "security": 7, "resource": 5, "content": 3,
         }
         sev_factor = {"critical": 4.0, "high": 2.5, "medium": 1.25, "low": 0.5}
-        score = sum(weights.get(i.kind, 4) * sev_factor.get(i.severity, 1) for i in self.issues)
-        score += len(self.hidden_pages) * 2
-        # scale mildly by density so single-page scans don't max out on nits
+        raw = sum(weights.get(i.kind, 4) * sev_factor.get(i.severity, 1) for i in self.issues)
+        raw += len(self.hidden_pages) * 2
+        if raw <= 0:
+            return 0
+        # Normalize by pages so large crawls don't saturate to 100 on nits,
+        # then apply diminishing returns: norm/(norm+K). K=10 keeps a single
+        # low-sev nit near ~13 weird while the 251-finding screenshot crawl
+        # lands ~71 weird (health ~29) instead of flatlining at 0 health.
         pages = max(1, len(self.pages))
-        density_bonus = min(10, int(score / max(2, pages)))
-        return max(0, min(100, int(score + density_bonus) if score else 0))
+        norm = raw / pages
+        return max(0, min(100, int(100 * norm / (norm + 10))))
 
     def verdict(self) -> tuple[str, str]:
         s = self.weirdness_score()

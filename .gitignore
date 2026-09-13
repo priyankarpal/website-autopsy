@@ -9,3 +9,9 @@ wheels/
 # Virtual environments
 .venv
 .env
+.agents
+skills-lock.json
+docs
+AGENTS.md
+.scratch
+autopsy-report
