@@ -18,7 +18,6 @@ MAX_LINKS_TO_VERIFY = 250
 async def _check_link_status(context, url: str, timeout_ms=10000) -> tuple[int | None, str]:
     """Use Playwright request (shares cookies) to check a link without full navigation."""
     try:
-        # Prefer HEAD, fall back to GET
         resp = await context.request.head(url, timeout=timeout_ms)
         status = resp.status
         if status in (405, 501):
@@ -26,12 +25,29 @@ async def _check_link_status(context, url: str, timeout_ms=10000) -> tuple[int |
             status = resp.status
         return status, ""
     except Exception as e:
-        # fallback: full GET
         try:
             resp = await context.request.get(url, timeout=timeout_ms)
             return resp.status, ""
         except Exception as e2:
             return None, str(e2)[:200]
+
+
+def audit_page(data: dict, page_url: str, load_ms: int, shot: str | None,
+               headers: dict, failed_reqs: list[str], bad_responses: list[dict],
+               result: AutopsyResult) -> None:
+    """Run every offline per-page audit over one collected bundle.
+
+    Pure: needs no browser, only the bundle plus listener-collected
+    failures. Append-only on result.
+    """
+    _audit_seo(data.get("seo", {}), page_url, shot, result)
+    _audit_a11y(data, page_url, shot, result)
+    _audit_perf(data, page_url, load_ms, shot, result)
+    _audit_content(data, page_url, shot, result)
+    _audit_network(failed_reqs, bad_responses, page_url, shot, result)
+    _audit_link_hygiene(data.get("links", []), page_url, result)
+    _audit_mixed_content(data.get("mixed", []), page_url, headers, result)
+    _run_depth_audits(data, page_url, load_ms, shot, headers, result)
 
 
 async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
@@ -66,7 +82,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
         context = await browser.new_context(ignore_https_errors=True)
-        # silence downloads blowing up
         page = await context.new_page()
 
         js_errors_seen: set[str] = set()
@@ -85,7 +100,7 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
             console_errors: list[str] = []
             page_errors: list[str] = []
             failed_reqs: list[str] = []
-            resp_log: list[dict] = []  # every sub-resource response for deep audit
+            resp_log: list[dict] = []
             main_headers: dict = {}
             main_final_url: str = nurl
 
@@ -158,7 +173,7 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                 _detach(page, _on_console, _on_pageerror, _on_failed, _on_response)
                 continue
 
-            # main-document headers (fallback: navigation response object)
+            # main-document headers
             if not main_headers and resp is not None:
                 try:
                     for k, v in (resp.headers or {}).items():
@@ -168,7 +183,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
             if is_first_page:
                 _audit_site_security(target, main_headers, context, result)
 
-            # page screenshot (proves state)
             pname, ppath = snap_name("page")
             try:
                 await page.screenshot(path=str(ppath), full_page=False)
@@ -179,7 +193,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                                            screenshot=f"screenshots/{pname}" if pname else None,
                                            links_found=0))
 
-            # --- slow page check ---
             if load_ms > 3000:
                 sev = "high" if load_ms > 8000 else "medium"
                 result.issues.append(Issue(
@@ -192,7 +205,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                     check="nav.load-budget",
                     evidence={"load_ms": load_ms}))
 
-            # --- JS errors ---
             for err in page_errors + console_errors:
                 key = hashlib_sig(nurl, err)
                 if key in js_errors_seen:
@@ -208,7 +220,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                     detail=err, page=nurl, severity="high",
                     screenshot=f"screenshots/{ename}" if ename else None))
 
-            # --- extract links + buttons + forms in one JS pass ---
             try:
                 data = await page.evaluate("""() => {
                   const q = s => [...document.querySelectorAll(s)];
@@ -291,7 +302,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                         "seo": {}, "res": [], "totKB": 0, "big": [], "mixed": [],
                         "domNodes": 0, "scripts": 0, "dupIds": [], "nav": {}}
 
-            # queue internal links
             internal_new = 0
             for l in data.get("links", []):
                 href = l.get("href", "")
@@ -323,18 +333,9 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                         site_script_urls.append(name)
 
             shot = f"screenshots/{pname}" if pname else None
-            # --- deep audits: SEO / a11y / perf / content / network / link hygiene ---
-            _audit_seo(data.get("seo", {}), nurl, shot, result)
-            _audit_a11y(data, nurl, shot, result)
-            _audit_perf(data, nurl, load_ms, shot, result)
-            _audit_content(data, nurl, shot, result)
-            _audit_network(failed_reqs, resp_log, nurl, shot, result)
-            _audit_link_hygiene(data.get("links", []), nurl, result)
-            _audit_mixed_content(data.get("mixed", []), nurl, main_headers, result)
-            # --- second-wave depth (additive evidence, pure seams) ---
-            _run_depth_audits(data, nurl, load_ms, shot, main_headers, result)
+            audit_page(data, nurl, load_ms, shot, main_headers,
+                       failed_reqs, resp_log, result)
 
-            # --- dead button test (visible only) ---
             candidates = [b for b in data.get("btns", []) if b.get("visible")][:MAX_BUTTONS_PER_PAGE]
             for b in candidates:
                 dead, detail, latency = await _test_button(page, b, nurl)
@@ -368,7 +369,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                         page=nurl, severity="medium",
                         screenshot=f"screenshots/{ename}" if ename else None))
 
-            # --- forms (deep: structure + labels + autocomplete + input types) ---
             for fi, f in enumerate(data.get("forms", [])[:6]):
                 result.forms_tested += 1
                 inputs = f.get("inputs", [])
@@ -428,7 +428,7 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                         page=nurl, severity="critical", screenshot=fshot,
                         recommendation="Switch to method=\"post\" over HTTPS. Never put credentials in query strings.",
                         check="sec.transport"))
-                # try a safe fill (no submit) to prove testability
+                # safe fill without submitting
                 try:
                     await _fill_form(page, fi)
                 except Exception:
@@ -438,12 +438,10 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
 
         await page.close()
 
-        # --- broken links verification (cap) ---
         link_items = list(all_links.items())[:MAX_LINKS_TO_VERIFY]
         for link_url, found_on in link_items:
             status_code, err = await _check_link_status(context, link_url)
             if status_code is None or status_code >= 400:
-                # screenshot the source page for proof
                 src_shot = next((p.screenshot for p in result.pages if p.url == normalize(found_on)), None)
                 reason = f"HTTP {status_code}" if status_code else f"request failed: {err[:120]}"
                 result.issues.append(Issue(
@@ -454,10 +452,8 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
                     screenshot=src_shot,
                     evidence={"link": link_url, "status": status_code}))
 
-        # --- hidden pages: robots/sitemap + common paths + orphans ---
         await _discover_hidden(context, target, result, shots, snap_name)
 
-        # --- cookie flag audit (deep transport check) ---
         try:
             cookies = await context.cookies()
             https = target.startswith("https://")
@@ -481,7 +477,6 @@ async def run_autopsy(target: str, out_dir: Path, max_pages: int = 30,
         except Exception:
             pass
 
-        # --- second-wave site depth: duplicate titles + posture review ---
         try:
             audit_site_seo_duplicates(
                 [{"url": p.url, "title": p.title} for p in result.pages], result)
@@ -612,10 +607,7 @@ async def _fill_form(page, form_idx: int):
             continue
 
 
-# ---------------------------------------------------------------------------
 # Deep audits: each maps to one or more entries in models.DEEP_CHECKS.
-# They only *add* issues when a real defect is measured — no noise.
-# ---------------------------------------------------------------------------
 
 def _audit_seo(seo: dict, page_url: str, shot: str | None, result: AutopsyResult) -> None:
     if not seo:
@@ -887,15 +879,6 @@ def _audit_site_security(target: str, headers: dict, context, result: AutopsyRes
             page=target, severity="critical",
             recommendation="Redirect all HTTP → HTTPS with HSTS preload.",
             check="sec.transport"))
-    # cookie flags
-    try:
-        import urllib.parse as _up
-        origin = f"{_up.urlparse(target).scheme}://{_up.urlparse(target).netloc}"
-        # cookies are read opportunistically; Playwright context may hold some already
-        async def _noop():  # placeholder — real read happens in run_autopsy via context.cookies
-            return []
-    except Exception:
-        pass
 
 
 def _run_depth_audits(data: dict, page_url: str, load_ms: int,
@@ -1243,18 +1226,16 @@ def audit_link_depth(links: list[dict], page_url: str, shot: str | None,
 
 async def _discover_hidden(context, target: str, result: AutopsyResult, shots: Path, snap_name) -> None:
     origin = f"{urllib.parse.urlparse(target).scheme}://{urllib.parse.urlparse(target).netloc}"
-    # robots.txt + sitemap.xml
     for path in ("robots.txt", "sitemap.xml"):
         try:
             r = await context.request.get(f"{origin}/{path}", timeout=8000)
             if r.status == 200:
                 body = (await r.text())[:4000]
                 name, p = snap_name("hidden")
-                # tiny text-proof screenshot placeholder: reuse first page shot
                 result.hidden_pages.append({"url": f"{origin}/{path}", "via": path, "detail": body[:300]})
         except Exception:
             pass
-    # common admin paths — only GET status, no screenshots hammering
+    # probe common paths by status only (no screenshots)
     sem = asyncio.Semaphore(6)
 
     async def probe(p: str):
@@ -1263,11 +1244,10 @@ async def _discover_hidden(context, target: str, result: AutopsyResult, shots: P
             try:
                 r = await context.request.get(u, timeout=7000)
                 if r.status and r.status < 400:
-                    # filter out soft-404: same title/length as homepage? keep simple: record 200s
+                    # soft-404s are not filtered here
                     result.hidden_pages.append({"url": u, "via": "common-path probe", "detail": f"HTTP {r.status}"})
             except Exception:
                 pass
 
     await asyncio.gather(*(probe(p) for p in COMMON_HIDDEN_PATHS if p not in ("robots.txt", "sitemap.xml")))
-    # cap
     result.hidden_pages = result.hidden_pages[:15]

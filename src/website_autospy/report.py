@@ -23,7 +23,6 @@ CATEGORIES: dict[str, tuple[str, str, str]] = {
 }
 
 SECTION_ORDER = ["security", "seo", "a11y", "perf", "resource", "broken_link", "content", "dead_button", "form", "slow", "js_error"]
-# normalise kinds into display sections
 SECTION_OF = {
     "security": "security", "seo": "seo", "a11y": "a11y",
     "perf": "performance", "slow": "performance",
@@ -170,7 +169,6 @@ def _img_tag(out_dir: Path, rel: str | None, thumb: bool = True) -> str:
 
 
 def _ring(score: int) -> str:
-    # score = health 0..100
     color = "#047857" if score >= 80 else "#a16207" if score >= 55 else "#c2410c" if score >= 30 else "#b42318"
     r = 62
     circ = 2 * 3.14159 * r
@@ -194,7 +192,6 @@ def _summary(result: AutopsyResult) -> str:
     total = sum(counts.values())
     if total == 0:
         return "<ul class='sumlist'><li><b>No issues found.</b> All checks passed on the crawled pages.</li></ul>"
-    # top offending categories
     by_kind: dict[str, int] = {}
     for i in result.issues:
         by_kind[i.kind] = by_kind.get(i.kind, 0) + 1
@@ -230,7 +227,6 @@ def write_report(result: AutopsyResult, out_dir: Path) -> Path:
     counts = result.severity_counts()
     total = sum(counts.values())
 
-    # group issues into display sections
     grouped: dict[str, list] = {k: [] for k in SECTIONS}
     for i in result.issues:
         sec = SECTION_OF.get(i.kind, "content")
@@ -238,12 +234,10 @@ def write_report(result: AutopsyResult, out_dir: Path) -> Path:
     for lst in grouped.values():
         lst.sort(key=lambda i: (SEV_RANK.get(i.severity, 2), i.title))
 
-    # per-page issue counts
     per_page: dict[str, int] = {}
     for i in result.issues:
         per_page[i.page] = per_page.get(i.page, 0) + 1
 
-    # ---- category overview cards ----
     cat_cards = ""
     for sec_key, (sec_title, sec_desc) in SECTIONS.items():
         items = grouped.get(sec_key, [])
@@ -259,7 +253,6 @@ def write_report(result: AutopsyResult, out_dir: Path) -> Path:
         ) or "<span class='pill'>0 issues</span>"
         cat_cards += f"<div class='cat'><b>{sec_title}</b><p>{sec_desc}</p><div class='counts'>{pills}</div></div>"
 
-    # ---- findings html ----
     def finding_card(i) -> str:
         cat = CATEGORIES.get(i.kind, ("General", "", ""))[0]
         ev = ""
@@ -281,7 +274,6 @@ def write_report(result: AutopsyResult, out_dir: Path) -> Path:
         sections_html += "".join(finding_card(i) for i in items) if items else \
             "<div class='empty'>No issues found in this category.</div>"
 
-    # ---- pages table ----
     if result.pages:
         avg_load = sum(p.load_ms for p in result.pages) / len(result.pages)
         tot_kb = sum(p.transfer_kb or 0 for p in result.pages)
@@ -300,7 +292,6 @@ def write_report(result: AutopsyResult, out_dir: Path) -> Path:
 <th style="text-align:right">Load</th><th style="text-align:right">Reqs</th><th style="text-align:right">Weight</th>
 <th style="text-align:right">DOM</th><th style="text-align:right">Issues</th></tr>{rows}</table>"""
 
-    # ---- coverage ledger ----
     failed_checks = {i.check for i in result.issues if i.check}
     cov_rows = ""
     try:
@@ -318,7 +309,6 @@ def write_report(result: AutopsyResult, out_dir: Path) -> Path:
                          f"<td><span class='{'fail' if failed else 'pass'}'>{'attention' if failed else 'pass'}</span></td></tr>")
     cov_tbl = f"<table class='tbl'><tr><th>Group</th><th>Deep check</th><th>Status</th></tr>{cov_rows}</table>"
 
-    # ---- hidden paths ----
     if result.hidden_pages:
         hid = "".join(
             f"<tr><td class='mono'>{esc(h.get('url', ''))}</td><td>{esc(h.get('via', ''))}</td>"
